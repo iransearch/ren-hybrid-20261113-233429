@@ -23,7 +23,7 @@ import tempfile
 import time
 
 LOG = logging.getLogger('ren_control')
-BUILD = 'ren-hybrid-5-keepalive-default'
+BUILD = 'ren-hybrid-6-mode-trial'
 ROOT = Path(__file__).resolve().parent
 ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED', 'ORIGIN_ROUTES_JSON', 'ORIGIN_KEEPALIVE_DOMAINS', 'ORIGIN_ERROR_LOGS'}
 HOSTNAME = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
@@ -92,6 +92,7 @@ class Settings:
     routes: tuple = ()
     keepalive_domains: tuple = ()
     error_logs: bool = False
+    proxy_mode: str = 'http'
     origin_port: int = 443
     origin_enabled: bool = True
     port: int = 10000
@@ -127,9 +128,12 @@ def load_settings(env=None):
         if not address.is_global and not allow_private: raise ValueError('ORIGIN_IP must be public IPv4')
     ca = Path(env.get('ORIGIN_CA_FILE', str(ROOT / 'cloudflare_origin_ca_roots.pem'))).resolve()
     ssl.create_default_context(cafile=str(ca))  # Reject missing/invalid trust roots before launch.
+    mode = str(env.get('HAPROXY_MODE','http')).lower().strip()
+    if mode not in ('http','tcp'): raise ValueError('HAPROXY_MODE must be http or tcp')
     result = Settings(
         str(address), host, routes=routes,
         keepalive_domains=tuple(route.domain for route in routes),
+        proxy_mode=mode,
         error_logs=boolean(env.get('ORIGIN_ERROR_LOGS','false'),'ORIGIN_ERROR_LOGS'),
         origin_port=443 if routes else number(env,'ORIGIN_PORT',443,integer=True),
         origin_enabled=True if routes else boolean(env.get('ORIGIN_ENABLED','true'),'ORIGIN_ENABLED'),
@@ -177,6 +181,7 @@ def quoted(path):
 
 
 def render_config(s: Settings, run_dir: Path, capacity: int):
+    if s.proxy_mode == 'tcp': return render_tcp_config(s, run_dir, capacity)
     def duration(value): return f"{max(1, math.ceil(value * 1000))}ms"
     # Resource ceiling applies to all frontend sockets, including idle HTTP.
     # Optional app admission control leaves additional room for health requests.
@@ -255,6 +260,62 @@ backend origin
 """)
     return prefix+routing+'\n'+'\n'.join(backends)
 
+
+
+def render_tcp_config(s: Settings, run_dir: Path, capacity: int):
+    # Render has already terminated TLS. Inspect the first HTTP/1 headers,
+    # then forward the connection unchanged; this is not TLS passthrough.
+    limit = capacity if not s.max_concurrent else min(capacity, s.max_concurrent + 256)
+    logging = ''
+    if s.error_logs:
+        logging = '    log global\n    option dontlog-normal\n    option log-separate-errors\n    log-format "REN_ORIGIN_ERROR mode=tcp backend=%b server=%s termination=%ts connect_ms=%Tc total_ms=%Tt ssl_error=%[ssl_bc_err] ssl_detail=%{+Q}[ssl_bc_err_str]"\n'
+    config = f'''global
+    master-worker
+    log stdout format raw local0 warning
+    nbthread {s.threads}
+    maxconn {limit}
+    stats socket {quoted(run_dir / 'stats.sock')} mode 600 level admin expose-fd listeners
+    stats timeout 2s
+    ssl-default-server-options ssl-min-ver TLSv1.2
+
+defaults
+    mode tcp
+{logging}    retries 0
+    timeout connect {math.ceil(s.connect_timeout*1000)}ms
+    timeout client {math.ceil(s.tunnel_idle_timeout*1000)}ms
+    timeout server {math.ceil(s.tunnel_idle_timeout*1000)}ms
+    timeout queue 100ms
+    timeout client-fin 5s
+    timeout server-fin 5s
+
+frontend public
+    bind 0.0.0.0:{s.port}
+    tcp-request inspect-delay 20s
+    tcp-request content set-var(sess.ren_host) req.hdr(host),lower,field(1,:) if {{ req.proto_http }}
+    tcp-request content set-var(sess.ren_health) bool(true) if {{ req.proto_http }} {{ path -m str /_ren/health }}
+    tcp-request content reject if {{ req.proto_http }} !{{ var(sess.ren_health) -m bool }} !{{ req.hdr(Upgrade) -i websocket }}
+    tcp-request content accept if {{ req.proto_http }}
+    tcp-request content reject if WAIT_END
+    use_backend ren_health if {{ var(sess.ren_health) -m bool }}
+'''
+    if s.max_concurrent:
+        # Apply one global admission limit; health remains reachable.
+        config = config.replace('    tcp-request content accept if', f'    tcp-request content reject if !{{ var(sess.ren_health) -m bool }} {{ fe_conn(public) gt {s.max_concurrent} }}\n    tcp-request content accept if')
+    if s.routes:
+        for i, route in enumerate(s.routes,1):
+            config += f'    use_backend origin_{i} if {{ var(sess.ren_host) -m str {route.domain} }}\n'
+    else:
+        config += '    default_backend origin\n'
+    config += '''
+backend ren_health
+    mode http
+    option httpclose
+    http-request return status 200 content-type application/json string '{"status":"ok"}'
+'''
+    targets = [(f'origin_{i}',r.origin_ip,r.origin_port,r.origin_sni,True) for i,r in enumerate(s.routes,1)] if s.routes else [('origin',s.origin_ip,s.origin_port,s.origin_sni,s.origin_enabled)]
+    for name,ip,port,sni,enabled in targets:
+        config += f'\nbackend {name}\n    tcp-response inspect-delay 20s\n    tcp-response content accept if {{ res.payload(0,12) -m str \"HTTP/1.1 101\" }}\n    tcp-response content reject if {{ res.len ge 12 }}\n    tcp-response content reject if WAIT_END\n    server target {ip}:{port} ssl verify required ca-file {quoted(run_dir / "origin-ca.pem")} sni str({sni}) verifyhost {sni} alpn http/1.1' + ('' if enabled else ' disabled') + '\n'
+    return config
 
 
 def runtime_command(path: Path, command: str, timeout=2):
@@ -390,7 +451,7 @@ class Controller:
         LOG.info('REN Hybrid online build=%s instance=%s python=%s max_concurrent=%s resource_capacity=%d fd_soft=%s fd_hard=%s threads=%d',
                  BUILD,os.getenv('RENDER_INSTANCE_ID') or socket.gethostname(),sys.version.split()[0],
                  self.settings.max_concurrent or 'unlimited',self.capacity,self.soft_fd,self.hard_fd,self.settings.threads)
-        LOG.info('REN_PERFORMANCE keepalive=all error_logs=%s',self.settings.error_logs)
+        LOG.info('REN_PERFORMANCE mode=%s keepalive=%s error_logs=%s',self.settings.proxy_mode,'all' if self.settings.proxy_mode == 'http' else 'disabled',self.settings.error_logs)
 
     def _confirm_reload(self):
         pending=self.pending_reload
@@ -456,7 +517,7 @@ class Controller:
 
     def log_metrics(self):
         current,old=worker_processes(self.master_socket)
-        sample={'build':BUILD,'instance':os.getenv('RENDER_INSTANCE_ID') or socket.gethostname(),
+        sample={'mode':self.settings.proxy_mode,'build':BUILD,'instance':os.getenv('RENDER_INSTANCE_ID') or socket.gethostname(),
                 'pid':os.getpid(),'uptime_s':round(time.monotonic()-self.started,1),'generation':self.generation,
                 'max_concurrent':self.settings.max_concurrent,'resource_capacity':self.capacity,
                 'current_workers':len(current),'draining_workers':len(old),
@@ -466,11 +527,18 @@ class Controller:
         stats=haproxy_stats(self.stats_socket); backends=stats.pop('backends',{})
         sample.update(stats)
         sample['origins']=[{'domain':route.domain,'backend':f'origin_{index}',
-                            'keepalive':route.domain in self.settings.keepalive_domains,
+                            'keepalive':self.settings.proxy_mode == 'http' and route.domain in self.settings.keepalive_domains,
                             **backends.get(f'origin_{index}',{})}
                            for index,route in enumerate(self.settings.routes,1)]
         if not self.settings.routes:
-            sample['origins']=[{'backend':'origin','keepalive':True,**backends.get('origin',{})}]
+            sample['origins']=[{'backend':'origin','keepalive':self.settings.proxy_mode == 'http',**backends.get('origin',{})}]
+
+        if self.settings.proxy_mode == 'tcp':
+            # TCP cannot observe HTTP status or per-message transfer failures.
+            for item in [sample, *sample['origins']]:
+                for key in ('frontend_5xx_total','origin_5xx_total','response_errors_total','backend_reuse_total'):
+                    if key in item: item[key] = None
+            sample['http_status_metrics_available'] = False
 
         # Old workers have their own counters. Query each via the master CLI.
         for pid in old:
