@@ -23,7 +23,7 @@ import tempfile
 import time
 
 LOG = logging.getLogger('ren_control')
-BUILD = 'ren-hybrid-6-mode-trial'
+BUILD = 'ren-hybrid-7-hybrid'
 ROOT = Path(__file__).resolve().parent
 ORIGIN_KEYS = {'ORIGIN_IP', 'ORIGIN_PORT', 'ORIGIN_SNI', 'ORIGIN_ENABLED', 'ORIGIN_ROUTES_JSON', 'ORIGIN_KEEPALIVE_DOMAINS', 'ORIGIN_ERROR_LOGS'}
 HOSTNAME = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
@@ -129,7 +129,7 @@ def load_settings(env=None):
     ca = Path(env.get('ORIGIN_CA_FILE', str(ROOT / 'cloudflare_origin_ca_roots.pem'))).resolve()
     ssl.create_default_context(cafile=str(ca))  # Reject missing/invalid trust roots before launch.
     mode = str(env.get('HAPROXY_MODE','http')).lower().strip()
-    if mode not in ('http','tcp'): raise ValueError('HAPROXY_MODE must be http or tcp')
+    if mode not in ('http','tcp','hybrid'): raise ValueError('HAPROXY_MODE must be http, tcp or hybrid')
     result = Settings(
         str(address), host, routes=routes,
         keepalive_domains=tuple(route.domain for route in routes),
@@ -182,6 +182,7 @@ def quoted(path):
 
 def render_config(s: Settings, run_dir: Path, capacity: int):
     if s.proxy_mode == 'tcp': return render_tcp_config(s, run_dir, capacity)
+    if s.proxy_mode == 'hybrid': return render_hybrid_config(s, run_dir, capacity)
     def duration(value): return f"{max(1, math.ceil(value * 1000))}ms"
     # Resource ceiling applies to all frontend sockets, including idle HTTP.
     # Optional app admission control leaves additional room for health requests.
@@ -262,14 +263,13 @@ backend origin
 
 
 
-def render_tcp_config(s: Settings, run_dir: Path, capacity: int):
-    # Render has already terminated TLS. Inspect the first HTTP/1 headers,
-    # then forward the connection unchanged; this is not TLS passthrough.
+def render_tcp_defaults(s: Settings, run_dir: Path, capacity: int):
     limit = capacity if not s.max_concurrent else min(capacity, s.max_concurrent + 256)
     logging = ''
     if s.error_logs:
         logging = '    log global\n    option dontlog-normal\n    option log-separate-errors\n    log-format "REN_ORIGIN_ERROR mode=tcp backend=%b server=%s termination=%ts connect_ms=%Tc total_ms=%Tt ssl_error=%[ssl_bc_err] ssl_detail=%{+Q}[ssl_bc_err_str]"\n'
-    config = f'''global
+        logging = logging.replace('mode=tcp', 'mode=' + s.proxy_mode)
+    return f'''global
     master-worker
     log stdout format raw local0 warning
     nbthread {s.threads}
@@ -288,6 +288,13 @@ defaults
     timeout client-fin 5s
     timeout server-fin 5s
 
+'''
+
+
+def render_tcp_config(s: Settings, run_dir: Path, capacity: int):
+    # Render has already terminated TLS. Inspect the first HTTP/1 headers,
+    # then forward the connection unchanged; this is not TLS passthrough.
+    config = render_tcp_defaults(s, run_dir, capacity) + f'''
 frontend public
     bind 0.0.0.0:{s.port}
     tcp-request inspect-delay 20s
@@ -316,6 +323,100 @@ backend ren_health
     for name,ip,port,sni,enabled in targets:
         config += f'\nbackend {name}\n    tcp-response inspect-delay 20s\n    tcp-response content accept if {{ res.payload(0,12) -m str \"HTTP/1.1 101\" }}\n    tcp-response content reject if {{ res.len ge 12 }}\n    tcp-response content reject if WAIT_END\n    server target {ip}:{port} ssl verify required ca-file {quoted(run_dir / "origin-ca.pem")} sni str({sni}) verifyhost {sni} alpn http/1.1' + ('' if enabled else ' disabled') + '\n'
     return config
+
+
+def render_hybrid_config(s: Settings, run_dir: Path, capacity: int):
+    # Only the first HTTP/1 request chooses raw WebSocket forwarding. Once
+    # upgraded to HTTP processing, subsequent requests are routed individually.
+    targets = [(f'origin_{i}', r) for i, r in enumerate(s.routes, 1)] if s.routes else [
+        ('origin', Route('', s.origin_ip, s.origin_sni, s.origin_port))]
+    table = tcp_admission = http_admission = ''
+    if s.max_concurrent:
+        # Reserve a shared tracker BEFORE testing the limit. Reference-count
+        # increments are atomic across threads; reading backend counts first
+        # can overbook. HTTP tracking ends with the transaction, raw WS with
+        # its stream. One constant key stores no client identifiers.
+        table = '    stick-table type integer size 1 expire 1h\n'
+        tcp_admission = ('    tcp-request content track-sc0 int(1) if { var(sess.ren_ws) -m bool } !{ var(sess.ren_health) -m bool }\n'
+                         f'    tcp-request content reject if {{ var(sess.ren_ws) -m bool }} !{{ var(sess.ren_health) -m bool }} {{ sc0_trackers gt {s.max_concurrent} }}\n')
+        http_admission = ('    http-request track-sc0 int(1)\n'
+                          f'    http-request return status 503 content-type text/plain string "Service Unavailable" hdr Retry-After 5 if {{ sc0_trackers gt {s.max_concurrent} }}\n')
+    config = render_tcp_defaults(s, run_dir, capacity) + f'''    timeout http-request 20s
+    timeout http-keep-alive 15s
+
+frontend public
+    bind 0.0.0.0:{s.port}
+{table}    tcp-request inspect-delay 20s
+    tcp-request content accept if {{ fc_http_major gt 0 }}
+    tcp-request content set-var(sess.ren_host) req.hdr(host),lower,field(1,:) if {{ req.proto_http }}
+    tcp-request content set-var(sess.ren_health) bool(true) if {{ req.proto_http }} {{ path -m str /_ren/health }}
+    tcp-request content set-var(sess.ren_ws) bool(true) if {{ req.proto_http }} {{ req.hdr(Upgrade) -i websocket }}
+'''
+    config += tcp_admission
+    config += '''    tcp-request content switch-mode http if { req.proto_http } !{ var(sess.ren_ws) -m bool }
+    tcp-request content accept if { req.proto_http }
+    tcp-request content reject if WAIT_END
+    http-request return status 200 content-type application/json string '{"status":"ok"}' if { path -m str /_ren/health }
+'''
+    config += '    http-request set-var(txn.ren_route_host) req.hdr(host),lower,field(1,:)\n'
+    if s.routes:
+        for route in s.routes:
+            config += f'    acl ren_known_host var(txn.ren_route_host) -m str {route.domain}\n'
+        config += '    http-request return status 421 content-type text/plain string "Unknown domain" unless ren_known_host\n'
+    config += http_admission
+    config += '    use_backend ren_health if { var(sess.ren_health) -m bool } !{ fc_http_major gt 0 }\n'
+    for name, route in targets:
+        if s.routes:
+            config += f'    use_backend {name}_ws if {{ var(sess.ren_ws) -m bool }} {{ var(sess.ren_host) -m str {route.domain} }}\n'
+            config += f'    use_backend {name} if !{{ var(sess.ren_ws) -m bool }} {{ var(txn.ren_route_host) -m str {route.domain} }}\n'
+        else:
+            config += f'    use_backend {name}_ws if {{ var(sess.ren_ws) -m bool }}\n    default_backend {name}\n'
+    config += '''
+backend ren_health
+    mode http
+    option httpclose
+    http-request return status 200 content-type application/json string '{"status":"ok"}'
+'''
+    for name, route in targets:
+        authority = route.origin_sni + (f':{route.origin_port}' if route.origin_port != 443 else '')
+        server = (f'    server target {route.origin_ip}:{route.origin_port} ssl verify required '
+                  f'ca-file {quoted(run_dir / "origin-ca.pem")} sni str({route.origin_sni}) '
+                  f'verifyhost {route.origin_sni}')
+        disabled = '' if s.routes or s.origin_enabled else ' disabled'
+        config += f'''
+backend {name}
+    mode http
+    option http-keep-alive
+    http-reuse safe
+    timeout server {math.ceil(s.http_read_timeout * 1000)}ms
+    http-request set-header Host {authority}
+{server} alpn h2,http/1.1{disabled}
+
+backend {name}_ws
+    mode tcp
+    tcp-response inspect-delay 20s
+    tcp-response content accept if {{ res.payload(0,12) -m str "HTTP/1.1 101" }}
+    tcp-response content reject if {{ res.len ge 12 }}
+    tcp-response content reject if WAIT_END
+{server} alpn http/1.1{disabled}
+'''
+    return config
+
+
+def hybrid_origin_metrics(name, backends):
+    http = dict(backends.get(name, {}))
+    ws = dict(backends.get(name + '_ws', {}))
+    for key in ('origin_5xx_total', 'response_errors_total', 'backend_reuse_total'):
+        ws[key] = None
+    result = {'backend': name, 'keepalive': True, 'keepalive_scope': 'http_only',
+              'http': http, 'websocket': ws}
+    for key in ('active', 'accepted_total', 'bytes_in_total', 'bytes_out_total',
+                'connect_errors_total', 'queued', 'backend_connect_total'):
+        values = (http.get(key), ws.get(key))
+        result[key] = sum(values) if all(v is not None for v in values) else None
+    for key in ('peak', 'avg_connect_ms', 'response_errors_total', 'origin_5xx_total', 'backend_reuse_total'):
+        result[key] = None  # Mixed or non-additive; inspect the transport records.
+    return result
 
 
 def runtime_command(path: Path, command: str, timeout=2):
@@ -451,7 +552,8 @@ class Controller:
         LOG.info('REN Hybrid online build=%s instance=%s python=%s max_concurrent=%s resource_capacity=%d fd_soft=%s fd_hard=%s threads=%d',
                  BUILD,os.getenv('RENDER_INSTANCE_ID') or socket.gethostname(),sys.version.split()[0],
                  self.settings.max_concurrent or 'unlimited',self.capacity,self.soft_fd,self.hard_fd,self.settings.threads)
-        LOG.info('REN_PERFORMANCE mode=%s keepalive=%s error_logs=%s',self.settings.proxy_mode,'all' if self.settings.proxy_mode == 'http' else 'disabled',self.settings.error_logs)
+        keepalive = {'http': 'all', 'tcp': 'disabled', 'hybrid': 'http_only'}[self.settings.proxy_mode]
+        LOG.info('REN_PERFORMANCE mode=%s keepalive=%s error_logs=%s',self.settings.proxy_mode,keepalive,self.settings.error_logs)
 
     def _confirm_reload(self):
         pending=self.pending_reload
@@ -486,7 +588,7 @@ class Controller:
         if fresh==self.settings and not self.runtime_dirty: return
         candidate=self.validate(fresh)
         old_settings=self.settings
-        if not fresh.routes and not old_settings.routes and replace(fresh,origin_enabled=old_settings.origin_enabled)==old_settings:
+        if fresh.proxy_mode != 'hybrid' and not fresh.routes and not old_settings.routes and replace(fresh,origin_enabled=old_settings.origin_enabled)==old_settings:
             # Mark before sending: a successful command can lose its reply.
             self.runtime_dirty=True
             if self._runtime_enabled()!=fresh.origin_enabled:
@@ -533,7 +635,14 @@ class Controller:
         if not self.settings.routes:
             sample['origins']=[{'backend':'origin','keepalive':self.settings.proxy_mode == 'http',**backends.get('origin',{})}]
 
-        if self.settings.proxy_mode == 'tcp':
+        if self.settings.proxy_mode == 'hybrid':
+            sample['origins'] = [{'domain': route.domain, **hybrid_origin_metrics(f'origin_{i}', backends)}
+                                 for i, route in enumerate(self.settings.routes, 1)] if self.settings.routes else [
+                                     hybrid_origin_metrics('origin', backends)]
+            sample['http_status_metrics_scope'] = 'http_backends_only'
+            sample['peak'] = None  # Independent backend maxima are not simultaneous.
+
+        if self.settings.proxy_mode in ('tcp', 'hybrid'):
             # TCP cannot observe HTTP status or per-message transfer failures.
             for item in [sample, *sample['origins']]:
                 for key in ('frontend_5xx_total','origin_5xx_total','response_errors_total','backend_reuse_total'):

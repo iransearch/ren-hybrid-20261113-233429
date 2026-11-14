@@ -1,6 +1,20 @@
+# Hybrid mode (gateway v7)
+
+Set `HAPROXY_MODE=hybrid`, or choose installer UPDATE > option 7 > hybrid. The TCP frontend preserves new WebSocket upgrades on raw TCP backends and uses HAProxy switch-mode to process other HTTP requests on HTTP backends. This removes the TCP trial's WebSocket-only rejection for XHTTP. HTTP paths/query/body stream without full-body buffering, and origin Host is rewritten to SNI/port. Origin HTTP backends negotiate h2 or HTTP/1.1; raw WebSocket uses HTTP/1.1 and preserves Host. Both enforce TLS certificate and hostname verification. Render remains HTTPS ingress with TLS termination, not public raw TCP.
+
+After a connection switches to HTTP processing, later requests (including a later WebSocket upgrade) remain in HTTP processing and route by each request's Host. A WebSocket connection whose first request is Upgrade retains the raw TCP path. HTTP backend read timeout defaults to 120s; raw TCP idle timeout defaults to 1h. Retries remain zero.
+
+Per-origin REN_METRICS contains separate `http` and `websocket` records. Aggregate traffic/connection counters include both. Mixed HTTP 5xx/response-error/reuse counters and aggregate peak are null; use the HTTP record only and heed `http_status_metrics_scope=http_backends_only`. TCP sessions and HTTP requests are different counting units. Counters reset on deploy/reload and are scoped to instance/generation. HTTP keep-alive applies only to the HTTP leg. Unknown HTTP hosts return 421; unknown raw WebSocket hosts close. Health remains public.
+
+The optional hybrid admission cap reserves one shared tracker across threads and both legs. HTTP transactions release their tracker at completion, including reused frontend connections. The cap is worker/generation-local; draining workers during reload are separate. `http_status_metrics_available=false` describes aggregate completeness, not the availability of nested HTTP counts.
+
+Existing modes `http` and WebSocket-only `tcp` are unchanged. Roll back with the same installer menu. Preparing this package does not change any live service. Local tests use HAProxy, verified TLS origins and incremental streaming; actual Xray client/Render ingress testing remains required.
+
+The historical sections below describe earlier versions; their HTTP-only keep-alive statements do not apply to raw TCP.
+
 # Default keep-alive for all origins
 
-HAProxy defaults use `option http-keep-alive` and `http-reuse safe` for every origin, including legacy single-origin mode. No country selection or enable flag is required. The obsolete ORIGIN_KEEPALIVE_DOMAINS variable is ignored even if an old deployment saved a value. New origins inherit the same policy. No HTTP/2, timeout, route mapping or retry changes; retries remain zero. WebSockets remain dedicated after Upgrade.
+HAProxy defaults use `option http-keep-alive` and `http-reuse safe` for every origin, including legacy single-origin mode. No country selection or enable flag is required. The obsolete ORIGIN_KEEPALIVE_DOMAINS variable is ignored even if an old deployment saved a value. New origins inherit the same policy. In HTTP mode, prior timeout, HTTP/1.1 routing and retry behavior is preserved; retries remain zero. WebSockets remain dedicated after Upgrade.
 
 Update the gateway code and deploy to apply this version. Installer option6 only toggles ORIGIN_ERROR_LOGS; it no longer asks for a mapping. Error logs exclude URI, credentials, headers and client IP. Per-origin metrics report keepalive=true for every route. Counters reset on deploy/reload; compare same-instance deltas over equal windows.
 
