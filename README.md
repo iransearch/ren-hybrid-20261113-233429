@@ -1,3 +1,31 @@
+Nginx completion events use nonblocking loopback UDP syslog rather than a pipe to Python. Delivery is best effort, so counters describe observed completions and may undercount under load; telemetry_loss_possible=true, telemetry_dropped_total=null. Slow diagnostics must never block data-plane workers. HTTP/1.1 and gRPC/H2 use independent upstream keepalive pools. Origin X-Accel instructions cannot internally replay requests or re-enable buffering. MAX_CONCURRENT accepts 0..65535 in Nginx.
+
+# Proxy engine at service creation
+
+Windows CREATE NEW asks `Proxy engine: haproxy, nginx or node [haproxy]`. HAProxy uses Dockerfile; Nginx uses Dockerfile.nginx and nginx_gateway.py; experimental Node uses Dockerfile.node, node_gateway.py and node_runtime.mjs. PROXY_ENGINE is creation metadata and never rewritten by UPDATE. Updates infer/cross-check the existing Dockerfile and engine marker. Old services retain HAProxy. HAProxy mode selection is hidden/denied for the other engines.
+
+Nginx routes each HTTP Host to its own verified-TLS origin. Ordinary HTTP and packet-up use unbuffered HTTP/1.1; WebSocket upgrades are supported. XHTTP's default application/grpc upload header selects grpc_pass over HTTP/2/TLS, including duplex stream-one. The origin must support h2 for that path. Disabling that header changes classification. No request replay or cross-origin fallback is enabled. The Docker image is pinned to the official nginx:1.28.3-alpine multi-platform digest; the HAProxy Dockerfile remains unchanged.
+
+Nginx emits sanitized completed-request counters only. Long-lived traffic is absent until completion. Request-length bytes omit WebSocket upload frames. Active connections, peak, TCP/TLS errors, response-transfer errors and reuse are null/unsupported, not zero. Raw Nginx error logs are suppressed because they can expose URIs, headers and client identifiers; safe status-only error events remain opt-in. Environment changes require deployment; file hot reload is not provided for Nginx.
+
+Local TLS/streaming tests do not prove live Xray/Render throughput. Do not attribute counter resets or completed-request-only counts to speed improvements.
+
+## Experimental Node.js XHTTP relay
+
+Select `node` only when creating a new service. Start live comparisons with XHTTP packet-up. This engine relays GET/HEAD/POST over verified HTTPS with HTTP/1.1 to origins; it does not support WebSocket, raw TCP or HTTP/2-only origins. It uses direct configured IP, verified SNI and rewritten Host, unchanged path/query and native streaming backpressure in both directions. Per-origin keepalive pools are independent. No retry, redirect following or cross-origin fallback is enabled. Client cancellation aborts its upstream. Python supervises and validates configuration; payload bytes pass only through Node. The Dockerfile uses the pinned official Node 24 Alpine image; no Windows Node installation is needed.
+
+REN_METRICS contains cumulative per-origin request, cancellation, connect/error, active/peak and actual TLS connection/reuse counters. Bytes count HTTP payload bodies observed by the relay, not on-wire bytes. Snapshots use bounded chunks over nonblocking loopback UDP; only complete matching sequences publish, and a lost sample recovers at the next complete cumulative snapshot. Check metrics_age_s before interpreting stale samples. Counters reset at process restart and are instance-local. Sanitized opt-in errors contain domain/phase/code only. MAX_CONCURRENT=0 remains unlimited; positive values cap active requests across all origins. No live speed advantage is claimed.
+
+### Node multicore cluster
+
+Node build ren-node-2 / ren-node-cluster-2 shares one pre-parsed tls.SecureContext per worker across origin connections. It retains public+custom CA roots, explicit verified SNI, rejectUnauthorized=true and independent per-route agents. Passing secureContext instead of raw ca on every request avoids duplicate parsed trust stores and large CA-based agent keys. No admission/rate cap was added. This applies to direct and cluster workers; local200-stream RSS measurements are not production capacity guarantees.
+
+NODE_WORKERS defaults to auto: affinity/cgroup CPUv2 or common CPUv1 quota, minimum1 and automatic maximum8. Explicit values1..32 are accepted. One worker runs the original direct runtime; two or more use node_cluster.mjs with standard-library cluster round-robin distribution of new frontend TCP connections. Existing keepalive connections stay with their worker. Python supervision, direct TLS streaming, routes and HTTP/1.1 semantics remain the same. The manager handles socket distribution, periodic telemetry and optional admission messages, never streaming bodies. Each worker owns a separate origin keepalive pool, so idle64 sockets is per-origin per-worker.
+
+MAX_CONCURRENT=0 has no per-request admission IPC or manual cap. A positive value applies to all workers in one instance; tokens are released at completion/cancellation and reclaimed after worker death. Health is exempt. A failed worker is replaced with bounded exponential backoff; its active streams can drop and are not replayed. Readiness requires every configured worker to listen. Shutdown drains up to20seconds, then forces cleanup; supervisor also kills the process group if the primary dies.
+
+Cluster metrics sum latest per-worker cumulative samples and last observed counters from exited workers. worker_pids/workers/current_workers/target_workers/restarts and per-worker sample_age_s expose freshness. active_scope=sum_of_latest_worker_samples; a cross-worker peak is unavailable/null, never a sum of individual peaks. Missing worker samples produce null counters with samples_complete=false. After a crash counters_incomplete=true persists because unsampled tail traffic may be lost. unsupported_upgrades_total is currently absent in cluster aggregates, not zero; rejection behavior remains enforced. When enabled, admitted_active is the primary's exact reservation count; it differs from sampled active requests. More workers consume additional RAM. Set NODE_WORKERS=1 and deploy for rollback; installer UPDATE code-only applies the new default to existing Node services without changing plan/instance count or asking for engine/worker selection. This does not establish production user capacity.
+
 # Hybrid mode (gateway v7)
 
 Set `HAPROXY_MODE=hybrid`, or choose installer UPDATE > option 7 > hybrid. The TCP frontend preserves new WebSocket upgrades on raw TCP backends and uses HAProxy switch-mode to process other HTTP requests on HTTP backends. This removes the TCP trial's WebSocket-only rejection for XHTTP. HTTP paths/query/body stream without full-body buffering, and origin Host is rewritten to SNI/port. Origin HTTP backends negotiate h2 or HTTP/1.1; raw WebSocket uses HTTP/1.1 and preserves Host. Both enforce TLS certificate and hostname verification. Render remains HTTPS ingress with TLS termination, not public raw TCP.
@@ -151,3 +179,11 @@ HAPROXY_BIN=/path/to/haproxy python3 -m unittest discover -s tests -v
 ریشه‌های عمومی Origin CA از مستندات رسمی Cloudflare دریافت شده‌اند:
 https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
 https://developers.cloudflare.com/ssl/static/origin_ca_ecc_root.pem
+
+## Node engine WebSocket support (ren-node-3 / ren-node-cluster-3)
+
+Node supports HTTP/1.1 XHTTP and WebSocket on the same listener and domain mappings. TLS trust is shared per worker; origin certificates/SNI remain verified. Raw socket pipes preserve frames, binary, fragmentation, ping/pong, subprotocol early data and extension negotiation, using native backpressure without parsing/recompressing payloads. The gateway does not generate WebSocket heartbeats.
+
+CONNECT_TIMEOUT covers TCP/TLS; WS_HANDSHAKE_TIMEOUT starts after verified TLS; TUNNEL_IDLE_TIMEOUT applies after 101. Existing HTTP_READ_TIMEOUT applies to HTTP. MAX_CONCURRENT is shared across HTTP and WebSocket, including cluster workers, and defaults to unlimited (0). Active counts include handshakes and HTTP; websocket_active counts established tunnels. bytes_scope is HTTP_payload_body_and_WebSocket_frames, excluding HTTP/TLS headers. SIGTERM allows 20 seconds to drain, then closes upgraded and ordinary sockets.
+
+Update the existing Node service with gateway-code-only. No new service or engine change is needed. Local TLS tests do not establish production Xray compatibility or Render capacity.
